@@ -1,10 +1,15 @@
 # Product Tag Suggester
 
-A microservice for suggesting product tags across images using visual similarity (CLIP embeddings).
+A microservice for suggesting product tags across images using YOLO26 + CLIP.
 
 ## Overview
 
 Given an image with tagged products, this service can detect if those products appear in another image and suggest tag positions.
+
+**How it works:**
+1. YOLO26 detects objects in the target image (fast, ~50-100ms)
+2. CLIP embeddings verify which detected objects match the source products
+3. Returns matched objects with bounding boxes and confidence scores
 
 **Example Use Case:**
 1. User uploads Image 1 (living room) and tags a sofa (product_123)
@@ -49,6 +54,8 @@ docker run -p 8000:8000 product-tag-suggester
 
 ### Suggest Tags
 
+Find tagged products from a source image in a target image.
+
 ```bash
 POST /api/suggest-tags
 Content-Type: application/json
@@ -62,7 +69,8 @@ Content-Type: application/json
     }
   ],
   "target_image_url": "https://example.com/image2.jpg",
-  "similarity_threshold": 0.75
+  "similarity_threshold": 0.70,
+  "detection_confidence": 0.25
 }
 ```
 
@@ -74,20 +82,54 @@ Content-Type: application/json
     {
       "product_id": "prod_123",
       "found": true,
-      "confidence": 0.87,
-      "suggested_bbox": { "x": 250, "y": 180, "width": 200, "height": 180 }
+      "confidence": 0.85,
+      "suggested_bbox": { "x": 250, "y": 180, "width": 210, "height": 195 },
+      "detected_class": "couch",
+      "detection_confidence": 0.92
     }
-  ]
+  ],
+  "detections_count": 5
 }
 ```
 
-### Compare Regions (Debug)
+### Detect Objects
+
+Detect all objects in an image. Useful for understanding what objects are present.
 
 ```bash
-POST /api/compare-regions?image1_url=...&bbox1=...&image2_url=...&bbox2=...
+POST /api/detect
+Content-Type: application/json
+
+{
+  "image_url": "https://example.com/image.jpg",
+  "confidence_threshold": 0.25,
+  "target_classes": ["chair", "couch", "bed"]  // optional filter
+}
 ```
 
-Returns similarity score between two specific regions.
+**Response:**
+
+```json
+{
+  "objects": [
+    {
+      "bbox": { "x": 100, "y": 150, "width": 200, "height": 180 },
+      "class_id": 57,
+      "class_name": "couch",
+      "confidence": 0.92
+    }
+  ],
+  "total_count": 1
+}
+```
+
+### Get Available Classes
+
+List all 80 COCO classes that YOLO can detect.
+
+```bash
+GET /api/classes
+```
 
 ### Health Check
 
@@ -99,38 +141,30 @@ GET /health
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `similarity_threshold` | 0.75 | Minimum similarity to consider a match (0-1) |
-| Model | `clip-vit-base-patch32` | CLIP model variant |
+| `similarity_threshold` | 0.70 | Minimum CLIP similarity to consider a match (0-1) |
+| `detection_confidence` | 0.25 | Minimum YOLO detection confidence (0-1) |
+| Model | `yolo26m.pt` | YOLO26 medium (balanced speed/accuracy) |
 
-### Using a More Accurate Model
+### Using a Different YOLO Model
 
-Edit `app/models/embeddings.py`:
+Edit `app/models/yolo.py`:
 
 ```python
 # Change from:
-model_name: str = "openai/clip-vit-base-patch32"
+model_name: str = "yolo26m.pt"
 
-# To:
-model_name: str = "openai/clip-vit-large-patch14"
+# To (faster, less accurate):
+model_name: str = "yolo26s.pt"
+
+# Or (slower, more accurate):
+model_name: str = "yolo26l.pt"
 ```
 
-Note: Larger model requires more memory (~2GB) and is slower.
+## Performance
 
-## Performance Considerations
-
-### Sliding Window Approach
-
-The current implementation uses sliding windows to search for products. This is:
-- **Pros:** Simple, works without training
-- **Cons:** Can be slow for large images or many tags
-
-### Optimization Ideas
-
-1. **Add object detection pre-filter**: Use YOLO/DETR to find candidate regions first
-2. **Downscale images**: Reduce resolution before processing
-3. **GPU acceleration**: Run on CUDA for ~10x speedup
-4. **Batch processing**: Process multiple windows in parallel
-5. **Caching**: Cache embeddings for frequently used product images
+- **Speed:** ~50-100ms per image (YOLO26 is 43% faster than YOLOv8)
+- **GPU:** Automatically uses CUDA if available (~10x faster)
+- **Detectable objects:** 80 COCO classes (furniture, electronics, vehicles, etc.)
 
 ## Integration with communa-web
 
@@ -148,16 +182,46 @@ const response = await fetch('http://localhost:8000/api/suggest-tags', {
       bbox: tag.bbox,
     })),
     target_image_url: images[1].url,
+    similarity_threshold: 0.70,
+    detection_confidence: 0.25,
   }),
 });
 
-const { suggestions } = await response.json();
+const { suggestions, detections_count } = await response.json();
 
 // Show suggestions to user
 suggestions
   .filter(s => s.found)
-  .forEach(s => showTagSuggestion(s.product_id, s.suggested_bbox));
+  .forEach(s => {
+    console.log(`Found ${s.detected_class} with ${s.confidence} confidence`);
+    showTagSuggestion(s.product_id, s.suggested_bbox);
+  });
 ```
+
+## Troubleshooting
+
+### SSL Certificate Error on macOS
+
+If you see `SSL: CERTIFICATE_VERIFY_FAILED` when downloading YOLO weights:
+
+```bash
+# Option 1: Install certificates for Python
+/Applications/Python\ 3.x/Install\ Certificates.command
+
+# Option 2: Manual download (if above doesn't work)
+# Download model from: https://github.com/ultralytics/assets/releases
+# Place in the project root or ~/.cache/ultralytics/
+```
+
+The code includes an automatic SSL bypass, but if it still fails, use the manual download option.
+
+### Model Download Issues
+
+YOLO model weights (~50MB) are downloaded on first run. If the download fails:
+
+1. Check your internet connection
+2. Try a smaller model: edit `app/models/yolo.py` to use `yolo26n.pt` instead of `yolo26m.pt`
+3. Pre-download manually from [Ultralytics releases](https://github.com/ultralytics/assets/releases)
 
 ## License
 

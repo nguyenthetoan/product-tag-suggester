@@ -1,7 +1,7 @@
 """
 Product Tag Suggester API
 
-FastAPI service for suggesting product tags across images using visual similarity.
+FastAPI service for suggesting product tags across images using YOLO + CLIP.
 """
 
 from contextlib import asynccontextmanager
@@ -14,7 +14,8 @@ from PIL import Image
 from pydantic import BaseModel, HttpUrl
 
 from app.models.embeddings import get_embedding_model
-from app.services.matcher import ProductMatcher, TagInfo
+from app.models.yolo import get_yolo_model
+from app.services.yolo_matcher import YOLOProductMatcher, YOLODirectMatcher, TagInfo
 
 
 # Request/Response models
@@ -38,42 +39,71 @@ class SourceTag(BaseModel):
 
 
 class SuggestTagsRequest(BaseModel):
-    """Request to find tagged products in a target image."""
+    """Request to find tagged products using YOLO detection."""
 
     source_image_url: HttpUrl
     source_tags: list[SourceTag]
     target_image_url: HttpUrl
-    similarity_threshold: float = 0.75
+    similarity_threshold: float = 0.70
+    detection_confidence: float = 0.25
 
 
 class TagSuggestion(BaseModel):
-    """Suggestion for a product tag in target image."""
+    """Suggestion for a product tag using YOLO detection."""
 
     product_id: str
     found: bool
     confidence: float
     suggested_bbox: BoundingBox | None = None
+    detected_class: str | None = None
+    detection_confidence: float | None = None
 
 
 class SuggestTagsResponse(BaseModel):
     """Response with tag suggestions."""
 
     suggestions: list[TagSuggestion]
+    detections_count: int
+
+
+class DetectedObject(BaseModel):
+    """A detected object in an image."""
+
+    bbox: BoundingBox
+    class_id: int
+    class_name: str
+    confidence: float
+
+
+class DetectObjectsRequest(BaseModel):
+    """Request to detect objects in an image."""
+
+    image_url: HttpUrl
+    confidence_threshold: float = 0.25
+    target_classes: list[str] | None = None
+
+
+class DetectObjectsResponse(BaseModel):
+    """Response with detected objects."""
+
+    objects: list[DetectedObject]
+    total_count: int
 
 
 # App setup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize model on startup."""
-    # Warm up the model
+    """Initialize models on startup."""
+    # Warm up the models
     get_embedding_model()
+    get_yolo_model()
     yield
 
 
 app = FastAPI(
     title="Product Tag Suggester",
-    description="Suggest product tags across images using visual similarity",
-    version="0.1.0",
+    description="Suggest product tags across images using YOLO + CLIP",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -117,18 +147,21 @@ async def health_check():
 @app.post("/api/suggest-tags", response_model=SuggestTagsResponse)
 async def suggest_tags(request: SuggestTagsRequest):
     """
-    Find tagged products from source image in target image.
+    Find tagged products using YOLO object detection + CLIP verification.
 
-    Given an image with tagged products (source), checks if any of those
-    products appear in another image (target) and suggests tag positions.
+    Uses YOLO26 to detect objects first, then verifies matches using CLIP embeddings.
+    This approach is fast (~50-100ms) and accurate.
 
     Example:
     - Source image: Living room with tagged sofa (product_123)
     - Target image: Another angle of the same room
-    - Result: {"suggestions": [{"product_id": "product_123", "found": true, ...}]}
+    - Result: YOLO detects furniture, CLIP matches the sofa
     """
     # Fetch images
-    source_image, target_image = await fetch_image(request.source_image_url), await fetch_image(request.target_image_url)
+    source_image, target_image = (
+        await fetch_image(request.source_image_url),
+        await fetch_image(request.target_image_url),
+    )
 
     # Convert tags to internal format
     tags = [
@@ -136,12 +169,19 @@ async def suggest_tags(request: SuggestTagsRequest):
         for tag in request.source_tags
     ]
 
-    # Run matcher
-    model = get_embedding_model()
-    matcher = ProductMatcher(
-        embedding_model=model,
+    # Run YOLO + CLIP matcher
+    yolo_model = get_yolo_model()
+    clip_model = get_embedding_model()
+    matcher = YOLOProductMatcher(
+        yolo_model=yolo_model,
+        embedding_model=clip_model,
         similarity_threshold=request.similarity_threshold,
+        detection_confidence=request.detection_confidence,
     )
+
+    # Get detections count for response
+    detections = matcher.detect_objects(target_image)
+    detections_count = len(detections)
 
     results = matcher.find_all_products(source_image, tags, target_image)
 
@@ -162,30 +202,75 @@ async def suggest_tags(request: SuggestTagsRequest):
                 if result.suggested_bbox
                 else None
             ),
+            detected_class=result.detected_class,
+            detection_confidence=result.detection_confidence,
         )
         suggestions.append(suggestion)
 
-    return SuggestTagsResponse(suggestions=suggestions)
+    return SuggestTagsResponse(
+        suggestions=suggestions,
+        detections_count=detections_count,
+    )
 
 
-@app.post("/api/compare-regions")
-async def compare_regions(
-    image1_url: HttpUrl,
-    bbox1: BoundingBox,
-    image2_url: HttpUrl,
-    bbox2: BoundingBox,
-):
+@app.post("/api/detect", response_model=DetectObjectsResponse)
+async def detect_objects(request: DetectObjectsRequest):
     """
-    Compare two specific regions and return similarity score.
+    Detect objects in an image using YOLO.
 
-    Useful for debugging or manual verification.
+    Returns all detected objects with their bounding boxes, class names, and confidence.
+    Optionally filter by specific class names.
+
+    Example:
+    - Request: {"image_url": "...", "target_classes": ["chair", "sofa"]}
+    - Response: List of detected chairs and sofas with bounding boxes
     """
-    image1, image2 = await fetch_image(str(image1_url)), await fetch_image(str(image2_url))
+    image = await fetch_image(request.image_url)
 
-    model = get_embedding_model()
-    emb1 = model.get_region_embedding(image1, bbox1.to_tuple())
-    emb2 = model.get_region_embedding(image2, bbox2.to_tuple())
+    yolo_model = get_yolo_model()
+    direct_matcher = YOLODirectMatcher(
+        yolo_model=yolo_model,
+        detection_confidence=request.confidence_threshold,
+    )
 
-    similarity = float((emb1 @ emb2).item())
+    detections = direct_matcher.detect_and_classify(
+        image,
+        target_classes=request.target_classes,
+    )
 
-    return {"similarity": round(similarity, 4)}
+    objects = [
+        DetectedObject(
+            bbox=BoundingBox(
+                x=det.bbox[0],
+                y=det.bbox[1],
+                width=det.bbox[2],
+                height=det.bbox[3],
+            ),
+            class_id=det.class_id,
+            class_name=det.class_name,
+            confidence=round(det.confidence, 3),
+        )
+        for det in detections
+    ]
+
+    return DetectObjectsResponse(
+        objects=objects,
+        total_count=len(objects),
+    )
+
+
+@app.get("/api/classes")
+async def get_yolo_classes():
+    """
+    Get all available YOLO class names.
+
+    Returns the 80 COCO classes that YOLO can detect.
+    Useful for filtering detections or understanding what objects can be detected.
+    """
+    yolo_model = get_yolo_model()
+    class_names = yolo_model.get_class_names()
+
+    return {
+        "classes": class_names,
+        "total_count": len(class_names),
+    }
