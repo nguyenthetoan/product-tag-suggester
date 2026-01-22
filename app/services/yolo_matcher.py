@@ -1,22 +1,19 @@
 """
 YOLO-based product matching service.
-Uses YOLO for object detection combined with CLIP embeddings for product verification.
-This approach is faster and more accurate than pure sliding-window search.
+Uses YOLO for object detection and class-based matching.
 """
 
 import logging
-import torch
 from PIL import Image
 from dataclasses import dataclass
 
 from app.models.yolo import YOLOModel, Detection
-from app.models.embeddings import EmbeddingModel
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class YOLOMatchResult:
+class MatchResult:
     """Result of matching a product using YOLO detection."""
 
     product_id: str
@@ -24,7 +21,6 @@ class YOLOMatchResult:
     confidence: float
     suggested_bbox: tuple[float, float, float, float] | None = None
     detected_class: str | None = None
-    detection_confidence: float | None = None
 
 
 @dataclass
@@ -35,37 +31,81 @@ class TagInfo:
     bbox: tuple[float, float, float, float]  # (x, y, width, height)
 
 
+def bbox_iou(box1: tuple, box2: tuple) -> float:
+    """Calculate Intersection over Union between two bboxes (x, y, w, h format)."""
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    
+    # Convert to x1, y1, x2, y2 format
+    box1_x2, box1_y2 = x1 + w1, y1 + h1
+    box2_x2, box2_y2 = x2 + w2, y2 + h2
+    
+    # Calculate intersection
+    inter_x1 = max(x1, x2)
+    inter_y1 = max(y1, y2)
+    inter_x2 = min(box1_x2, box2_x2)
+    inter_y2 = min(box1_y2, box2_y2)
+    
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+    
+    inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    
+    # Calculate union
+    box1_area = w1 * h1
+    box2_area = w2 * h2
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0.0
+
+
 class YOLOProductMatcher:
     """
-    Product matcher that uses YOLO for detection and CLIP for verification.
+    Product matcher that uses YOLO for detection and class-based matching.
     
     Strategy:
-    1. Detect objects in target image using YOLO
-    2. For each tagged product in source, get its CLIP embedding
-    3. Compare source product embedding with detected objects in target
-    4. Return the best matching detection that exceeds threshold
+    1. Detect objects in source image to identify the class of each tagged product
+    2. Detect objects in target image
+    3. Match by object class - find the same class in target
+    4. If multiple matches, use position/size heuristics
     """
 
     def __init__(
         self,
         yolo_model: YOLOModel,
-        embedding_model: EmbeddingModel,
-        similarity_threshold: float = 0.70,
         detection_confidence: float = 0.25,
+        iou_threshold: float = 0.3,
     ):
         """
         Initialize the YOLO-based product matcher.
 
         Args:
             yolo_model: YOLO model for object detection
-            embedding_model: CLIP model for embedding extraction
-            similarity_threshold: Minimum CLIP similarity for a match
             detection_confidence: Minimum YOLO detection confidence
+            iou_threshold: Minimum IoU to consider a detection as covering the tag
         """
         self.yolo = yolo_model
-        self.clip = embedding_model
-        self.similarity_threshold = similarity_threshold
         self.detection_confidence = detection_confidence
+        self.iou_threshold = iou_threshold
+
+    def _find_class_for_tag(
+        self,
+        image: Image.Image,
+        tag_bbox: tuple[float, float, float, float],
+    ) -> Detection | None:
+        """Find the YOLO detection that best covers the tagged region."""
+        detections = self.yolo.detect(image, confidence_threshold=self.detection_confidence)
+        
+        best_detection = None
+        best_iou = 0.0
+        
+        for det in detections:
+            iou = bbox_iou(tag_bbox, det.bbox)
+            if iou > best_iou and iou >= self.iou_threshold:
+                best_iou = iou
+                best_detection = det
+        
+        return best_detection
 
     def find_product_in_image(
         self,
@@ -73,9 +113,9 @@ class YOLOProductMatcher:
         tag: TagInfo,
         target_image: Image.Image,
         target_detections: list[Detection] | None = None,
-    ) -> YOLOMatchResult:
+    ) -> MatchResult:
         """
-        Find a tagged product from source image in target image using YOLO + CLIP.
+        Find a tagged product from source image in target image using YOLO.
 
         Args:
             source_image: Image containing the tagged product
@@ -84,61 +124,64 @@ class YOLOProductMatcher:
             target_detections: Pre-computed detections (for batch efficiency)
 
         Returns:
-            YOLOMatchResult with match details
+            MatchResult with match details
         """
-        # Get embedding of the tagged product region
-        source_embedding = self.clip.get_region_embedding(source_image, tag.bbox)
+        # Step 1: Find what class the tagged product is
+        source_detection = self._find_class_for_tag(source_image, tag.bbox)
         
-        # Detect objects in target if not provided
-        if target_detections is None:
-            target_detections = self.yolo.detect_with_embedding_regions(
-                target_image, 
-                confidence_threshold=self.detection_confidence,
+        if source_detection is None:
+            logger.info(
+                f"Product {tag.product_id}: No YOLO detection covers the tagged region"
             )
-        
-        logger.info(
-            f"Searching for product {tag.product_id}: "
-            f"source_bbox={tag.bbox}, detections_count={len(target_detections)}"
-        )
-
-        if not target_detections:
-            logger.info(f"No objects detected in target image")
-            return YOLOMatchResult(
+            return MatchResult(
                 product_id=tag.product_id,
                 found=False,
                 confidence=0.0,
             )
-
-        # Get embeddings for all detected regions in batch
-        detection_bboxes = [det.bbox for det in target_detections]
-        detection_embeddings = self.clip.get_region_embeddings_batch(
-            target_image, detection_bboxes
-        )
-
-        # Compute similarities
-        similarities = torch.matmul(detection_embeddings, source_embedding)
-        
-        # Find best match
-        best_idx = torch.argmax(similarities).item()
-        best_similarity = float(similarities[best_idx])
-        best_detection = target_detections[best_idx]
         
         logger.info(
-            f"Best match: class={best_detection.class_name}, "
-            f"similarity={best_similarity:.3f}, "
-            f"detection_conf={best_detection.confidence:.3f}, "
-            f"bbox={best_detection.bbox}"
+            f"Product {tag.product_id}: Tagged region detected as '{source_detection.class_name}' "
+            f"(conf={source_detection.confidence:.3f})"
         )
-
-        found = best_similarity >= self.similarity_threshold
-
-        return YOLOMatchResult(
+        
+        # Step 2: Detect objects in target if not provided
+        if target_detections is None:
+            target_detections = self.yolo.detect(
+                target_image, 
+                confidence_threshold=self.detection_confidence,
+            )
+        
+        # Step 3: Find matching class in target
+        matching_detections = [
+            det for det in target_detections 
+            if det.class_name == source_detection.class_name
+        ]
+        
+        if not matching_detections:
+            logger.info(
+                f"Product {tag.product_id}: No '{source_detection.class_name}' found in target"
+            )
+            return MatchResult(
+                product_id=tag.product_id,
+                found=False,
+                confidence=0.0,
+                detected_class=source_detection.class_name,
+            )
+        
+        # Step 4: Pick the best match (highest confidence)
+        best_match = max(matching_detections, key=lambda d: d.confidence)
+        
+        logger.info(
+            f"Product {tag.product_id}: Found '{best_match.class_name}' in target "
+            f"(conf={best_match.confidence:.3f}, bbox={best_match.bbox})"
+        )
+        
+        return MatchResult(
             product_id=tag.product_id,
-            found=found,
-            confidence=round(best_similarity, 3),
-            suggested_bbox=best_detection.bbox if found else None,
-            detected_class=best_detection.class_name if found else None,
-            detection_confidence=round(best_detection.confidence, 3) if found else None,
+            found=True,
+            confidence=round(best_match.confidence, 3),
+            suggested_bbox=best_match.bbox,
+            detected_class=best_match.class_name,
         )
 
     def find_all_products(
@@ -146,7 +189,7 @@ class YOLOProductMatcher:
         source_image: Image.Image,
         tags: list[TagInfo],
         target_image: Image.Image,
-    ) -> list[YOLOMatchResult]:
+    ) -> list[MatchResult]:
         """
         Find all tagged products from source image in target image.
 
@@ -156,10 +199,10 @@ class YOLOProductMatcher:
             target_image: Image to search for products
 
         Returns:
-            List of YOLOMatchResult for each tag
+            List of MatchResult for each tag
         """
-        # Pre-compute detections once for efficiency
-        target_detections = self.yolo.detect_with_embedding_regions(
+        # Pre-compute target detections once for efficiency
+        target_detections = self.yolo.detect(
             target_image,
             confidence_threshold=self.detection_confidence,
         )
@@ -195,10 +238,7 @@ class YOLOProductMatcher:
 
 class YOLODirectMatcher:
     """
-    Simpler YOLO-only matcher that just uses object detection.
-    
-    For cases where you want to detect specific object types without 
-    embedding comparison. Useful when you know the object category.
+    Simple YOLO detector for direct object detection.
     """
 
     def __init__(

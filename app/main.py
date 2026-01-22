@@ -13,7 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel, HttpUrl
 
-from app.models.embeddings import get_embedding_model
 from app.models.yolo import get_yolo_model
 from app.services.yolo_matcher import YOLOProductMatcher, YOLODirectMatcher, TagInfo
 
@@ -44,7 +43,6 @@ class SuggestTagsRequest(BaseModel):
     source_image_url: HttpUrl
     source_tags: list[SourceTag]
     target_image_url: HttpUrl
-    similarity_threshold: float = 0.70
     detection_confidence: float = 0.25
 
 
@@ -53,10 +51,9 @@ class TagSuggestion(BaseModel):
 
     product_id: str
     found: bool
-    confidence: float
+    confidence: float  # YOLO detection confidence
     suggested_bbox: BoundingBox | None = None
-    detected_class: str | None = None
-    detection_confidence: float | None = None
+    detected_class: str | None = None  # COCO class name (e.g., "couch", "chair")
 
 
 class SuggestTagsResponse(BaseModel):
@@ -93,9 +90,7 @@ class DetectObjectsResponse(BaseModel):
 # App setup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize models on startup."""
-    # Warm up the models
-    get_embedding_model()
+    """Initialize YOLO model on startup."""
     get_yolo_model()
     yield
 
@@ -147,15 +142,16 @@ async def health_check():
 @app.post("/api/suggest-tags", response_model=SuggestTagsResponse)
 async def suggest_tags(request: SuggestTagsRequest):
     """
-    Find tagged products using YOLO object detection + CLIP verification.
+    Find tagged products using YOLO object detection.
 
-    Uses YOLO26 to detect objects first, then verifies matches using CLIP embeddings.
-    This approach is fast (~50-100ms) and accurate.
+    Uses YOLO26 to detect the object class of tagged products in the source image,
+    then finds matching object classes in the target image.
+    This approach is fast (~50-100ms).
 
     Example:
     - Source image: Living room with tagged sofa (product_123)
     - Target image: Another angle of the same room
-    - Result: YOLO detects furniture, CLIP matches the sofa
+    - Result: YOLO detects "couch" class in both images, suggests tag position
     """
     # Fetch images
     source_image, target_image = (
@@ -169,13 +165,10 @@ async def suggest_tags(request: SuggestTagsRequest):
         for tag in request.source_tags
     ]
 
-    # Run YOLO + CLIP matcher
+    # Run YOLO matcher
     yolo_model = get_yolo_model()
-    clip_model = get_embedding_model()
     matcher = YOLOProductMatcher(
         yolo_model=yolo_model,
-        embedding_model=clip_model,
-        similarity_threshold=request.similarity_threshold,
         detection_confidence=request.detection_confidence,
     )
 
@@ -203,7 +196,6 @@ async def suggest_tags(request: SuggestTagsRequest):
                 else None
             ),
             detected_class=result.detected_class,
-            detection_confidence=result.detection_confidence,
         )
         suggestions.append(suggestion)
 

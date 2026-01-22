@@ -1,20 +1,21 @@
 # Product Tag Suggester
 
-A microservice for suggesting product tags across images using YOLO26 + CLIP.
+A microservice for suggesting product tags across images using YOLO26 object detection.
 
 ## Overview
 
 Given an image with tagged products, this service can detect if those products appear in another image and suggest tag positions.
 
 **How it works:**
-1. YOLO26 detects objects in the target image (fast, ~50-100ms)
-2. CLIP embeddings verify which detected objects match the source products
-3. Returns matched objects with bounding boxes and confidence scores
+1. YOLO26 detects the object class of the tagged region in source image (e.g., "couch")
+2. YOLO26 detects objects in the target image
+3. Matches by object class - finds the same class in target image
+4. Returns matched objects with bounding boxes and confidence scores
 
 **Example Use Case:**
 1. User uploads Image 1 (living room) and tags a sofa (product_123)
 2. User uploads Image 2 (another angle of the room)
-3. Service detects the same sofa in Image 2 and suggests tagging it
+3. Service detects "couch" in both images and suggests tagging it in Image 2
 
 ## Quick Start
 
@@ -69,7 +70,6 @@ Content-Type: application/json
     }
   ],
   "target_image_url": "https://example.com/image2.jpg",
-  "similarity_threshold": 0.70,
   "detection_confidence": 0.25
 }
 ```
@@ -82,10 +82,9 @@ Content-Type: application/json
     {
       "product_id": "prod_123",
       "found": true,
-      "confidence": 0.85,
+      "confidence": 0.92,
       "suggested_bbox": { "x": 250, "y": 180, "width": 210, "height": 195 },
-      "detected_class": "couch",
-      "detection_confidence": 0.92
+      "detected_class": "couch"
     }
   ],
   "detections_count": 5
@@ -131,6 +130,8 @@ List all 80 COCO classes that YOLO can detect.
 GET /api/classes
 ```
 
+**Common furniture classes:** bed, chair, couch, dining table, potted plant, tv
+
 ### Health Check
 
 ```bash
@@ -141,7 +142,6 @@ GET /health
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `similarity_threshold` | 0.70 | Minimum CLIP similarity to consider a match (0-1) |
 | `detection_confidence` | 0.25 | Minimum YOLO detection confidence (0-1) |
 | Model | `yolo26m.pt` | YOLO26 medium (balanced speed/accuracy) |
 
@@ -166,6 +166,12 @@ model_name: str = "yolo26l.pt"
 - **GPU:** Automatically uses CUDA if available (~10x faster)
 - **Detectable objects:** 80 COCO classes (furniture, electronics, vehicles, etc.)
 
+## Limitations
+
+- Only detects objects in the 80 COCO classes
+- Cannot distinguish between two different products of the same class (e.g., two different couches will both be detected as "couch")
+- Best suited for rooms with distinct furniture types
+
 ## Integration with communa-web
 
 Call this service from your React Router action/loader:
@@ -182,7 +188,6 @@ const response = await fetch('http://localhost:8000/api/suggest-tags', {
       bbox: tag.bbox,
     })),
     target_image_url: images[1].url,
-    similarity_threshold: 0.70,
     detection_confidence: 0.25,
   }),
 });
