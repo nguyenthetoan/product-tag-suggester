@@ -23,9 +23,17 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the server
-uvicorn app.main:app --reload --port 8000
+# Option 1: Gunicorn (recommended - more stable, better signal handling)
+gunicorn app.main:app -c gunicorn.conf.py
+
+# Option 2: Uvicorn with timeout (for development with hot reload)
+uvicorn app.main:app --reload --port 8000 --timeout-keep-alive 120
+
+# Option 3: Uvicorn without reload (more stable than --reload)
+uvicorn app.main:app --port 8000 --timeout-keep-alive 120
 ```
+
+**Tip:** If uvicorn won't stop with Ctrl+C, use `kill -9 $(lsof -t -i:8000)` to force kill.
 
 ### Docker
 

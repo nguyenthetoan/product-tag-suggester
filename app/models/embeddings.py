@@ -43,6 +43,26 @@ class EmbeddingModel:
         embedding = embedding / embedding.norm(dim=-1, keepdim=True)
         return embedding.squeeze(0).cpu()
 
+    @torch.no_grad()
+    def get_embeddings_batch(self, images: list[Image.Image]) -> torch.Tensor:
+        """
+        Extract embeddings from multiple images in a batch (faster than one-by-one).
+
+        Args:
+            images: List of PIL Image objects
+
+        Returns:
+            Normalized embedding tensor of shape (N, embed_dim)
+        """
+        if not images:
+            return torch.tensor([])
+        
+        inputs = self.processor(images=images, return_tensors="pt", padding=True).to(self.device)
+        embeddings = self.model.get_image_features(**inputs)
+        # Normalize for cosine similarity
+        embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
+        return embeddings.cpu()
+
     def get_region_embedding(
         self,
         image: Image.Image,
@@ -61,6 +81,27 @@ class EmbeddingModel:
         x, y, w, h = bbox
         cropped = image.crop((x, y, x + w, y + h))
         return self.get_embedding(cropped)
+
+    def get_region_embeddings_batch(
+        self,
+        image: Image.Image,
+        bboxes: list[tuple[float, float, float, float]],
+    ) -> torch.Tensor:
+        """
+        Extract embeddings from multiple regions in a batch.
+
+        Args:
+            image: PIL Image object
+            bboxes: List of bounding boxes as (x, y, width, height) in pixels
+
+        Returns:
+            Normalized embedding tensor of shape (N, embed_dim)
+        """
+        crops = []
+        for x, y, w, h in bboxes:
+            cropped = image.crop((x, y, x + w, y + h))
+            crops.append(cropped)
+        return self.get_embeddings_batch(crops)
 
 
 @lru_cache(maxsize=1)
