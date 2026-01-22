@@ -1,7 +1,8 @@
 """
 Product Tag Suggester API
 
-FastAPI service for suggesting product tags across images using YOLO + CLIP.
+FastAPI service for detecting tagged products across images.
+Uses YOLO for fast candidate detection + CLIP for accurate matching.
 """
 
 from contextlib import asynccontextmanager
@@ -14,7 +15,8 @@ from PIL import Image
 from pydantic import BaseModel, HttpUrl
 
 from app.models.yolo import get_yolo_model
-from app.services.yolo_matcher import YOLOProductMatcher, YOLODirectMatcher, TagInfo
+from app.models.embeddings import get_embedding_model
+from app.services.yolo_matcher import ProductMatcher, DirectDetector, TagInfo
 
 
 # Request/Response models
@@ -38,22 +40,22 @@ class SourceTag(BaseModel):
 
 
 class SuggestTagsRequest(BaseModel):
-    """Request to find tagged products using YOLO detection."""
+    """Request to find tagged products in target image."""
 
     source_image_url: HttpUrl
     source_tags: list[SourceTag]
     target_image_url: HttpUrl
-    detection_confidence: float = 0.25
+    similarity_threshold: float = 0.75
 
 
 class TagSuggestion(BaseModel):
-    """Suggestion for a product tag using YOLO detection."""
+    """Suggestion for a product tag."""
 
     product_id: str
     found: bool
-    confidence: float  # YOLO detection confidence
+    confidence: float  # CLIP similarity score (0-1)
     suggested_bbox: BoundingBox | None = None
-    detected_class: str | None = None  # COCO class name (e.g., "couch", "chair")
+    detected_class: str | None = None  # YOLO class if available
 
 
 class SuggestTagsResponse(BaseModel):
@@ -90,24 +92,25 @@ class DetectObjectsResponse(BaseModel):
 # App setup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize YOLO model on startup."""
+    """Initialize models on startup."""
     get_yolo_model()
+    get_embedding_model()
     yield
 
 
 app = FastAPI(
     title="Product Tag Suggester",
-    description="Suggest product tags across images using YOLO + CLIP",
-    version="0.2.0",
+    description="Detect tagged products across images using YOLO + CLIP",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
-# CORS middleware - allow requests from frontend
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",  # Vite dev server
-        "http://localhost:3000",  # Alternative dev port
+        "http://localhost:5173",
+        "http://localhost:3000",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:3000",
     ],
@@ -142,16 +145,20 @@ async def health_check():
 @app.post("/api/suggest-tags", response_model=SuggestTagsResponse)
 async def suggest_tags(request: SuggestTagsRequest):
     """
-    Find tagged products using YOLO object detection.
+    Find tagged products from source image in target image.
 
-    Uses YOLO26 to detect the object class of tagged products in the source image,
-    then finds matching object classes in the target image.
-    This approach is fast (~50-100ms).
+    How it works:
+    1. YOLO detects candidate regions in target image (fast)
+    2. CLIP compares the source tagged product with each candidate
+    3. Returns matches above the similarity threshold
+
+    This can match ANY product (kettles, toasters, furniture, etc.) 
+    regardless of whether YOLO knows the object class.
 
     Example:
-    - Source image: Living room with tagged sofa (product_123)
-    - Target image: Another angle of the same room
-    - Result: YOLO detects "couch" class in both images, suggests tag position
+    - Source image: Kitchen with tagged SMEG kettle
+    - Target image: Another angle of the same kitchen
+    - Result: Finds the same kettle and returns its position
     """
     # Fetch images
     source_image, target_image = (
@@ -165,18 +172,20 @@ async def suggest_tags(request: SuggestTagsRequest):
         for tag in request.source_tags
     ]
 
-    # Run YOLO matcher
+    # Run hybrid YOLO + CLIP matcher
     yolo_model = get_yolo_model()
-    matcher = YOLOProductMatcher(
+    clip_model = get_embedding_model()
+    matcher = ProductMatcher(
         yolo_model=yolo_model,
-        detection_confidence=request.detection_confidence,
+        embedding_model=clip_model,
+        similarity_threshold=request.similarity_threshold,
     )
 
-    # Get detections count for response
+    results = matcher.find_all_products(source_image, tags, target_image)
+    
+    # Get YOLO detections count for info
     detections = matcher.detect_objects(target_image)
     detections_count = len(detections)
-
-    results = matcher.find_all_products(source_image, tags, target_image)
 
     # Convert to response format
     suggestions = []
@@ -210,22 +219,17 @@ async def detect_objects(request: DetectObjectsRequest):
     """
     Detect objects in an image using YOLO.
 
-    Returns all detected objects with their bounding boxes, class names, and confidence.
-    Optionally filter by specific class names.
-
-    Example:
-    - Request: {"image_url": "...", "target_classes": ["chair", "sofa"]}
-    - Response: List of detected chairs and sofas with bounding boxes
+    Returns all detected objects with bounding boxes and class names.
     """
     image = await fetch_image(request.image_url)
 
     yolo_model = get_yolo_model()
-    direct_matcher = YOLODirectMatcher(
+    detector = DirectDetector(
         yolo_model=yolo_model,
         detection_confidence=request.confidence_threshold,
     )
 
-    detections = direct_matcher.detect_and_classify(
+    detections = detector.detect_and_classify(
         image,
         target_classes=request.target_classes,
     )
@@ -253,16 +257,9 @@ async def detect_objects(request: DetectObjectsRequest):
 
 @app.get("/api/classes")
 async def get_yolo_classes():
-    """
-    Get all available YOLO class names.
-
-    Returns the 80 COCO classes that YOLO can detect.
-    Useful for filtering detections or understanding what objects can be detected.
-    """
+    """Get all available YOLO class names (80 COCO classes)."""
     yolo_model = get_yolo_model()
-    class_names = yolo_model.get_class_names()
-
     return {
-        "classes": class_names,
-        "total_count": len(class_names),
+        "classes": yolo_model.get_class_names(),
+        "total_count": len(yolo_model.get_class_names()),
     }

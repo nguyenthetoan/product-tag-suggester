@@ -8,7 +8,8 @@ pydantic==2.12.5
 torch==2.9.1
 torchvision==0.24.1
 Pillow==12.1.0
-ultralytics>=8.4.0  # YOLO26 for object detection (latest)
+ultralytics>=8.4.0  # YOLO26 for object detection
+transformers>=4.40.0  # CLIP for embedding matching
 
 # HTTP / Utils
 httpx==0.28.1

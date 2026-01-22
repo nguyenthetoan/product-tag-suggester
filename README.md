@@ -1,21 +1,22 @@
 # Product Tag Suggester
 
-A microservice for suggesting product tags across images using YOLO26 object detection.
+A microservice for detecting tagged products across images using YOLO + CLIP.
 
 ## Overview
 
-Given an image with tagged products, this service can detect if those products appear in another image and suggest tag positions.
+Given an image with tagged products, this service detects if those same products appear in another image and returns their positions.
 
 **How it works:**
-1. YOLO26 detects the object class of the tagged region in source image (e.g., "couch")
-2. YOLO26 detects objects in the target image
-3. Matches by object class - finds the same class in target image
-4. Returns matched objects with bounding boxes and confidence scores
+1. **YOLO** detects candidate regions in target image (fast, ~50ms)
+2. **CLIP** compares the source tagged product with each candidate region
+3. Returns matches above the similarity threshold with bounding boxes
+
+This approach can match **any product** (kettles, toasters, furniture, etc.) regardless of whether YOLO knows the object class.
 
 **Example Use Case:**
-1. User uploads Image 1 (living room) and tags a sofa (product_123)
-2. User uploads Image 2 (another angle of the room)
-3. Service detects "couch" in both images and suggests tagging it in Image 2
+1. User uploads Image 1 (kitchen) and tags a SMEG kettle
+2. User uploads Image 2 (another angle of the kitchen)
+3. Service finds the same kettle in Image 2 and returns its position
 
 ## Quick Start
 
@@ -29,25 +30,17 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Option 1: Gunicorn (recommended - more stable, better signal handling)
+# Run with Gunicorn (recommended)
 gunicorn app.main:app -c gunicorn.conf.py
 
-# Option 2: Uvicorn with timeout (for development with hot reload)
-uvicorn app.main:app --reload --port 8000 --timeout-keep-alive 120
-
-# Option 3: Uvicorn without reload (more stable than --reload)
-uvicorn app.main:app --port 8000 --timeout-keep-alive 120
+# Or with Uvicorn (development)
+uvicorn app.main:app --reload --port 8000
 ```
-
-**Tip:** If uvicorn won't stop with Ctrl+C, use `kill -9 $(lsof -t -i:8000)` to force kill.
 
 ### Docker
 
 ```bash
-# Build
 docker build -t product-tag-suggester .
-
-# Run
 docker run -p 8000:8000 product-tag-suggester
 ```
 
@@ -55,22 +48,22 @@ docker run -p 8000:8000 product-tag-suggester
 
 ### Suggest Tags
 
-Find tagged products from a source image in a target image.
+Find tagged products from source image in target image.
 
 ```bash
 POST /api/suggest-tags
 Content-Type: application/json
 
 {
-  "source_image_url": "https://example.com/image1.jpg",
+  "source_image_url": "https://example.com/kitchen1.jpg",
   "source_tags": [
     {
-      "product_id": "prod_123",
-      "bbox": { "x": 100, "y": 150, "width": 200, "height": 180 }
+      "product_id": "smeg_kettle_123",
+      "bbox": { "x": 100, "y": 150, "width": 80, "height": 120 }
     }
   ],
-  "target_image_url": "https://example.com/image2.jpg",
-  "detection_confidence": 0.25
+  "target_image_url": "https://example.com/kitchen2.jpg",
+  "similarity_threshold": 0.75
 }
 ```
 
@@ -80,20 +73,20 @@ Content-Type: application/json
 {
   "suggestions": [
     {
-      "product_id": "prod_123",
+      "product_id": "smeg_kettle_123",
       "found": true,
-      "confidence": 0.92,
-      "suggested_bbox": { "x": 250, "y": 180, "width": 210, "height": 195 },
-      "detected_class": "couch"
+      "confidence": 0.87,
+      "suggested_bbox": { "x": 250, "y": 180, "width": 85, "height": 125 },
+      "detected_class": "bottle"
     }
   ],
-  "detections_count": 5
+  "detections_count": 12
 }
 ```
 
 ### Detect Objects
 
-Detect all objects in an image. Useful for understanding what objects are present.
+Detect all objects in an image using YOLO.
 
 ```bash
 POST /api/detect
@@ -102,35 +95,15 @@ Content-Type: application/json
 {
   "image_url": "https://example.com/image.jpg",
   "confidence_threshold": 0.25,
-  "target_classes": ["chair", "couch", "bed"]  // optional filter
-}
-```
-
-**Response:**
-
-```json
-{
-  "objects": [
-    {
-      "bbox": { "x": 100, "y": 150, "width": 200, "height": 180 },
-      "class_id": 57,
-      "class_name": "couch",
-      "confidence": 0.92
-    }
-  ],
-  "total_count": 1
+  "target_classes": ["chair", "couch", "bed"]
 }
 ```
 
 ### Get Available Classes
 
-List all 80 COCO classes that YOLO can detect.
-
 ```bash
 GET /api/classes
 ```
-
-**Common furniture classes:** bed, chair, couch, dining table, potted plant, tv
 
 ### Health Check
 
@@ -142,42 +115,18 @@ GET /health
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `detection_confidence` | 0.25 | Minimum YOLO detection confidence (0-1) |
-| Model | `yolo26m.pt` | YOLO26 medium (balanced speed/accuracy) |
-
-### Using a Different YOLO Model
-
-Edit `app/models/yolo.py`:
-
-```python
-# Change from:
-model_name: str = "yolo26m.pt"
-
-# To (faster, less accurate):
-model_name: str = "yolo26s.pt"
-
-# Or (slower, more accurate):
-model_name: str = "yolo26l.pt"
-```
+| `similarity_threshold` | 0.75 | Minimum CLIP similarity for a match (0-1) |
+| `detection_confidence` | 0.15 | Internal YOLO confidence (lower = more candidates) |
 
 ## Performance
 
-- **Speed:** ~50-100ms per image (YOLO26 is 43% faster than YOLOv8)
-- **GPU:** Automatically uses CUDA if available (~10x faster)
-- **Detectable objects:** 80 COCO classes (furniture, electronics, vehicles, etc.)
-
-## Limitations
-
-- Only detects objects in the 80 COCO classes
-- Cannot distinguish between two different products of the same class (e.g., two different couches will both be detected as "couch")
-- Best suited for rooms with distinct furniture types
+- **Speed:** ~100-200ms per request (YOLO ~50ms + CLIP ~50-150ms)
+- **GPU:** Automatically uses CUDA if available (~5-10x faster)
+- **Accuracy:** Can match any product, not limited to 80 COCO classes
 
 ## Integration with communa-web
 
-Call this service from your React Router action/loader:
-
 ```typescript
-// In your post form handler
 const response = await fetch('http://localhost:8000/api/suggest-tags', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -188,45 +137,30 @@ const response = await fetch('http://localhost:8000/api/suggest-tags', {
       bbox: tag.bbox,
     })),
     target_image_url: images[1].url,
-    detection_confidence: 0.25,
+    similarity_threshold: 0.75,
   }),
 });
 
-const { suggestions, detections_count } = await response.json();
+const { suggestions } = await response.json();
 
-// Show suggestions to user
 suggestions
   .filter(s => s.found)
-  .forEach(s => {
-    console.log(`Found ${s.detected_class} with ${s.confidence} confidence`);
-    showTagSuggestion(s.product_id, s.suggested_bbox);
-  });
+  .forEach(s => showTagSuggestion(s.product_id, s.suggested_bbox));
 ```
 
 ## Troubleshooting
 
 ### SSL Certificate Error on macOS
 
-If you see `SSL: CERTIFICATE_VERIFY_FAILED` when downloading YOLO weights:
-
 ```bash
-# Option 1: Install certificates for Python
 /Applications/Python\ 3.x/Install\ Certificates.command
-
-# Option 2: Manual download (if above doesn't work)
-# Download model from: https://github.com/ultralytics/assets/releases
-# Place in the project root or ~/.cache/ultralytics/
 ```
-
-The code includes an automatic SSL bypass, but if it still fails, use the manual download option.
 
 ### Model Download Issues
 
-YOLO model weights (~50MB) are downloaded on first run. If the download fails:
-
-1. Check your internet connection
-2. Try a smaller model: edit `app/models/yolo.py` to use `yolo26n.pt` instead of `yolo26m.pt`
-3. Pre-download manually from [Ultralytics releases](https://github.com/ultralytics/assets/releases)
+Models are downloaded on first run (~200MB total). If download fails:
+1. Check internet connection
+2. Pre-download from [Ultralytics releases](https://github.com/ultralytics/assets/releases)
 
 ## License
 
