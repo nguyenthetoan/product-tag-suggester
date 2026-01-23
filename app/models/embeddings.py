@@ -9,6 +9,13 @@ from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from functools import lru_cache
 
+try:
+    from app.models.embeddings_onnx import ONNXEmbeddingModel, get_onnx_embedding_model
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+    print("Warning: ONNX embedding model not available. Falling back to PyTorch CLIP.")
+
 
 class EmbeddingModel:
     """Wrapper for CLIP model to extract image embeddings."""
@@ -139,6 +146,21 @@ class EmbeddingModel:
 
 
 @lru_cache(maxsize=1)
-def get_embedding_model() -> EmbeddingModel:
-    """Get singleton instance of the embedding model."""
-    return EmbeddingModel()
+def get_embedding_model():
+    """
+    Get singleton instance of the embedding model.
+    
+    Uses ONNX Runtime model for faster inference (4-12x speedup).
+    Falls back to PyTorch CLIP if ONNX is not available.
+    """
+    if ONNX_AVAILABLE:
+        try:
+            # Use ONNX model (faster - 4-12x speedup)
+            return get_onnx_embedding_model()
+        except Exception as e:
+            print(f"Warning: Failed to load ONNX model: {e}")
+            print("Falling back to PyTorch CLIP model.")
+            return EmbeddingModel()
+    else:
+        # Fallback to PyTorch CLIP
+        return EmbeddingModel()

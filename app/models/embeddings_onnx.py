@@ -48,9 +48,19 @@ class ONNXEmbeddingModel:
 
         # Setup execution providers (GPU first, then CPU fallback)
         providers = []
+        provider_options = []
         if use_gpu and torch.cuda.is_available():
+            # Configure CUDAExecutionProvider to reduce Memcpy nodes
+            # Note: enable_cuda_graph requires ALL nodes to be on CUDA, which may not be possible
+            # IOBinding will still eliminate Memcpy nodes without requiring CUDA graph
+            cuda_options = {
+                "tunable_op_enable": "1",  # Enable tunable ops for better performance
+                "tunable_op_tuning_enable": "1",  # Enable tuning
+            }
             providers.append("CUDAExecutionProvider")
+            provider_options.append(cuda_options)
         providers.append("CPUExecutionProvider")
+        provider_options.append({})
 
         # Create inference session
         sess_options = ort.SessionOptions()
@@ -59,7 +69,7 @@ class ONNXEmbeddingModel:
 
         try:
             self.session = ort.InferenceSession(
-                model_path, sess_options=sess_options, providers=providers
+                model_path, sess_options=sess_options, providers=providers, provider_options=provider_options
             )
             print(f"ONNX model loaded from {model_path}")
             print(f"Execution providers: {self.session.get_providers()}")
@@ -67,6 +77,13 @@ class ONNXEmbeddingModel:
             raise RuntimeError(f"Failed to load ONNX model from {model_path}: {e}")
 
         self.device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+        self.use_gpu = use_gpu and torch.cuda.is_available()
+        
+        # Create IOBinding for GPU to avoid Memcpy nodes
+        if self.use_gpu:
+            self.io_binding = self.session.io_binding()
+        else:
+            self.io_binding = None
         self.input_name = self.session.get_inputs()[0].name
         
         # Get output name (may be "image_embeds" or "pooler_output" depending on export method)
@@ -82,21 +99,22 @@ class ONNXEmbeddingModel:
         print(f"Model input size: {self.input_size}x{self.input_size}")
         print(f"Model output name: {self.output_name}")
 
-    def _preprocess_image(self, image: Image.Image) -> np.ndarray:
+    def _preprocess_image(self, image: Image.Image, use_gpu_tensor: bool = False) -> np.ndarray | torch.Tensor:
         """
         Preprocess a single image for ONNX model input.
         Uses CLIP's preprocessing (normalized to [-1, 1] range).
 
         Args:
             image: PIL Image object
+            use_gpu_tensor: If True, return GPU tensor to avoid Memcpy nodes
 
         Returns:
-            Preprocessed image as numpy array
+            Preprocessed image as numpy array or torch tensor
         """
         # Resize to model input size
         image = image.resize((self.input_size, self.input_size), Image.Resampling.BILINEAR)
         
-        # Convert to numpy array
+        # Convert to numpy array first (PIL -> numpy is efficient)
         img_array = np.array(image, dtype=np.float32)
         
         # Normalize to [0, 1]
@@ -112,22 +130,33 @@ class ONNXEmbeddingModel:
         img_array = np.transpose(img_array, (2, 0, 1))  # HWC -> CHW
         img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension
         
+        # Convert to GPU tensor if requested to avoid Memcpy nodes
+        if use_gpu_tensor:
+            return torch.from_numpy(img_array).cuda()
+        
         return img_array
 
-    def _preprocess_batch(self, images: list[Image.Image]) -> np.ndarray:
+    def _preprocess_batch(self, images: list[Image.Image], use_gpu_tensor: bool = False) -> np.ndarray | torch.Tensor:
         """
         Preprocess a batch of images.
 
         Args:
             images: List of PIL Image objects
+            use_gpu_tensor: If True, return GPU tensor to avoid Memcpy nodes
 
         Returns:
-            Preprocessed batch as numpy array of shape (N, C, H, W)
+            Preprocessed batch as numpy array or torch tensor of shape (N, C, H, W)
         """
         batch = []
         for img in images:
-            batch.append(self._preprocess_image(img))
-        return np.concatenate(batch, axis=0)
+            batch.append(self._preprocess_image(img, use_gpu_tensor=False))  # Always use numpy for concatenation
+        batch_array = np.concatenate(batch, axis=0)
+        
+        # Convert to GPU tensor if requested
+        if use_gpu_tensor:
+            return torch.from_numpy(batch_array).cuda()
+        
+        return batch_array
 
     def get_embedding(self, image: Image.Image, return_cpu: bool = False) -> torch.Tensor:
         """
@@ -140,12 +169,32 @@ class ONNXEmbeddingModel:
         Returns:
             Normalized embedding tensor
         """
-        # Preprocess
-        input_array = self._preprocess_image(image)
+        # Preprocess to numpy first (PIL operations are CPU-based)
+        input_array = self._preprocess_image(image, use_gpu_tensor=False)
         
-        # Run inference
-        outputs = self.session.run([self.output_name], {self.input_name: input_array})
-        embedding = outputs[0]
+        # Use IOBinding for GPU to avoid Memcpy nodes
+        if self.use_gpu:
+            # Create OrtValue directly on GPU to avoid CPU-GPU copy in graph
+            # This allocates on GPU and copies data in one operation, avoiding Memcpy nodes
+            input_ortvalue = ort.OrtValue.ortvalue_from_numpy(input_array, "cuda", 0)
+            
+            # Use IOBinding to bind GPU memory directly
+            self.io_binding.clear_binding_inputs()
+            self.io_binding.bind_ortvalue_input(self.input_name, input_ortvalue)
+            
+            # Bind output to GPU - let ONNX Runtime allocate it
+            self.io_binding.bind_output(self.output_name, "cuda")
+            
+            # Run inference
+            self.session.run_with_iobinding(self.io_binding)
+            
+            # Get output from IOBinding (already on GPU)
+            outputs = self.io_binding.copy_outputs_to_cpu()
+            embedding = outputs[0]
+        else:
+            # CPU path - use numpy arrays
+            outputs = self.session.run([self.output_name], {self.input_name: input_array})
+            embedding = outputs[0]
         
         # Handle different output shapes
         # If output is 2D (batch, features), take first item
@@ -202,11 +251,30 @@ class ONNXEmbeddingModel:
             batch_images = images[i:i + batch_size]
             
             # Preprocess batch (even if size 1, keeps code consistent)
-            input_batch = self._preprocess_batch(batch_images)
+            input_batch = self._preprocess_batch(batch_images, use_gpu_tensor=False)
             
-            # Run inference
-            outputs = self.session.run([self.output_name], {self.input_name: input_batch})
-            batch_embeddings = outputs[0]
+            # Use IOBinding for GPU to avoid Memcpy nodes
+            if self.use_gpu:
+                # Create OrtValue for input (GPU memory)
+                input_ortvalue = ort.OrtValue.ortvalue_from_numpy(input_batch, "cuda", 0)
+                
+                # Use IOBinding to bind GPU memory directly
+                self.io_binding.clear_binding_inputs()
+                self.io_binding.bind_ortvalue_input(self.input_name, input_ortvalue)
+                
+                # Bind output to GPU - let ONNX Runtime allocate it
+                self.io_binding.bind_output(self.output_name, "cuda")
+                
+                # Run inference
+                self.session.run_with_iobinding(self.io_binding)
+                
+                # Get output from IOBinding (already on GPU)
+                outputs = self.io_binding.copy_outputs_to_cpu()
+                batch_embeddings = outputs[0]
+            else:
+                # CPU path - use numpy arrays
+                outputs = self.session.run([self.output_name], {self.input_name: input_batch})
+                batch_embeddings = outputs[0]
             
             # Handle different output shapes
             # If output is 2D (batch, features), process each item
