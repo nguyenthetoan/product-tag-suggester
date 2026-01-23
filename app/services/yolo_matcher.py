@@ -81,23 +81,38 @@ class ProductMatcher:
         source_bbox: tuple[float, float, float, float],
     ) -> list[tuple[float, Candidate]]:
         """
-        Coarse grid search with large stride.
+        Coarse grid search with optimized stride to limit candidates.
         Returns top candidates with their similarities.
         """
         img_w, img_h = target_image.size
         src_w, src_h = source_bbox[2], source_bbox[3]
         
-        # Use source size as window, with 1.0 stride (no overlap)
+        # Use source size as window
         win_w, win_h = int(src_w), int(src_h)
-        stride = max(win_w, win_h)  # Large stride for speed
         
         # Ensure minimum window size
         win_w = max(40, win_w)
         win_h = max(40, win_h)
         
+        # Calculate stride to limit total candidates
+        # Balanced limit for good performance vs accuracy
+        max_candidates = 150  # Balanced for high-end GPU (was 300, too many)
+        estimated_candidates_x = max(1, (img_w - win_w) // win_w + 1)
+        estimated_candidates_y = max(1, (img_h - win_h) // win_h + 1)
+        total_estimated = estimated_candidates_x * estimated_candidates_y
+        
+        if total_estimated > max_candidates:
+            # Increase stride to reduce candidates
+            stride_multiplier = (total_estimated / max_candidates) ** 0.5
+            stride_x = max(win_w, int(win_w * stride_multiplier))
+            stride_y = max(win_h, int(win_h * stride_multiplier))
+        else:
+            stride_x = win_w
+            stride_y = win_h
+        
         candidates = []
-        for y in range(0, img_h - win_h + 1, stride):
-            for x in range(0, img_w - win_w + 1, stride):
+        for y in range(0, img_h - win_h + 1, stride_y):
+            for x in range(0, img_w - win_w + 1, stride_x):
                 candidates.append(Candidate(
                     bbox=(float(x), float(y), float(win_w), float(win_h)),
                     source="coarse",
@@ -106,13 +121,36 @@ class ProductMatcher:
         if not candidates:
             return []
         
-        # Batch compute similarities
+        # Batch compute similarities (keep on GPU for speed)
         bboxes = [c.bbox for c in candidates]
-        embeddings = self.clip.get_region_embeddings_batch(target_image, bboxes)
-        similarities = torch.matmul(embeddings, source_embedding).tolist()
+        embeddings = self.clip.get_region_embeddings_batch(target_image, bboxes, return_cpu=False)
         
-        # Return candidates with similarities
-        return list(zip(similarities, candidates))
+        # Ensure source_embedding is on same device
+        if source_embedding.device != embeddings.device:
+            source_embedding = source_embedding.to(embeddings.device)
+        
+        # Compute similarities on GPU
+        similarities = torch.matmul(embeddings, source_embedding)
+        
+        # Sort on GPU for better performance, then move top results to CPU
+        # Get top-k indices on GPU (faster than sorting all on CPU)
+        k = min(50, len(candidates))  # Keep top 50 for further processing
+        if similarities.dim() > 1:
+            similarities = similarities.squeeze(1)
+        top_k_values, top_k_indices = torch.topk(similarities, k, dim=0)
+        
+        # Move only top-k to CPU
+        top_k_values_list = top_k_values.cpu().tolist()
+        top_k_indices_list = top_k_indices.cpu().tolist()
+        if not isinstance(top_k_values_list, list):
+            top_k_values_list = [top_k_values_list]
+        if not isinstance(top_k_indices_list, list):
+            top_k_indices_list = [top_k_indices_list]
+        
+        # Return top candidates with similarities, sorted by similarity
+        results = [(sim, candidates[idx]) for sim, idx in zip(top_k_values_list, top_k_indices_list)]
+        results.sort(key=lambda x: x[0], reverse=True)
+        return results
 
     def _fine_search(
         self,
@@ -123,13 +161,15 @@ class ProductMatcher:
     ) -> list[tuple[float, Candidate]]:
         """
         Fine search around a center point at multiple scales.
+        Optimized to limit candidate count.
         """
         img_w, img_h = target_image.size
         src_w, src_h = source_bbox[2], source_bbox[3]
         cx, cy = center
         
         candidates = []
-        scales = [0.6, 0.8, 1.0, 1.2, 1.5]
+        # Balanced scales for good performance vs accuracy
+        scales = [0.8, 1.0, 1.2]  # 3 scales for good balance
         
         for scale in scales:
             win_w = int(src_w * scale)
@@ -138,9 +178,10 @@ class ProductMatcher:
             if win_w < 20 or win_h < 20:
                 continue
             
-            # Search in a small region around center
-            search_range = max(win_w, win_h)
-            stride = max(1, int(min(win_w, win_h) * 0.25))  # Fine stride
+            # Balanced search range for performance
+            search_range = int(max(win_w, win_h) * 0.5)  # Balanced range
+            # Balanced stride for performance
+            stride = max(2, int(min(win_w, win_h) * 0.3))  # Balanced stride
             
             for dy in range(-search_range, search_range + 1, stride):
                 for dx in range(-search_range, search_range + 1, stride):
@@ -159,12 +200,25 @@ class ProductMatcher:
         if not candidates:
             return []
         
-        # Batch compute similarities
+        # Batch compute similarities (keep on GPU for speed)
         bboxes = [c.bbox for c in candidates]
-        embeddings = self.clip.get_region_embeddings_batch(target_image, bboxes)
-        similarities = torch.matmul(embeddings, source_embedding).tolist()
+        embeddings = self.clip.get_region_embeddings_batch(target_image, bboxes, return_cpu=False)
         
-        return list(zip(similarities, candidates))
+        # Ensure source_embedding is on same device
+        if source_embedding.device != embeddings.device:
+            source_embedding = source_embedding.to(embeddings.device)
+        
+        # Compute similarities on GPU
+        similarities = torch.matmul(embeddings, source_embedding)
+        if similarities.dim() > 1:
+            similarities = similarities.squeeze(1)
+        
+        # Move to CPU only for final result
+        similarities_list = similarities.cpu().tolist()
+        if not isinstance(similarities_list, list):
+            similarities_list = [similarities_list]
+        
+        return list(zip(similarities_list, candidates))
 
     def find_product_in_image(
         self,
@@ -176,8 +230,8 @@ class ProductMatcher:
         """
         Find a tagged product using coarse-to-fine search.
         """
-        # Get CLIP embedding of the tagged product
-        source_embedding = self.clip.get_region_embedding(source_image, tag.bbox)
+        # Get CLIP embedding of the tagged product (keep on GPU)
+        source_embedding = self.clip.get_region_embedding(source_image, tag.bbox, return_cpu=False)
         
         # Get YOLO detections
         if yolo_detections is None:
@@ -188,13 +242,22 @@ class ProductMatcher:
         
         all_results: list[tuple[float, Candidate]] = []
         
-        # Add YOLO detections
+        # Add YOLO detections (keep on GPU for speed)
         if yolo_detections:
             yolo_bboxes = [det.bbox for det in yolo_detections]
-            yolo_embeddings = self.clip.get_region_embeddings_batch(target_image, yolo_bboxes)
-            yolo_sims = torch.matmul(yolo_embeddings, source_embedding).tolist()
+            yolo_embeddings = self.clip.get_region_embeddings_batch(target_image, yolo_bboxes, return_cpu=False)
             
-            for det, sim in zip(yolo_detections, yolo_sims):
+            # Ensure source_embedding is on same device
+            if source_embedding.device != yolo_embeddings.device:
+                source_embedding = source_embedding.to(yolo_embeddings.device)
+            
+            # Compute similarities on GPU
+            yolo_sims = torch.matmul(yolo_embeddings, source_embedding)
+            
+            # Move to CPU only for final result
+            yolo_sims_list = yolo_sims.cpu().tolist()
+            
+            for det, sim in zip(yolo_detections, yolo_sims_list):
                 all_results.append((sim, Candidate(
                     bbox=det.bbox,
                     source="yolo",
@@ -216,23 +279,31 @@ class ProductMatcher:
                 confidence=0.0,
             )
         
-        # Sort by similarity, get top 3 for fine search
+        # Sort by similarity, get top candidates for fine search
         all_results.sort(key=lambda x: x[0], reverse=True)
-        top_candidates = all_results[:3]
+        best_coarse_sim = all_results[0][0] if all_results else 0.0
         
-        # Fine search around top candidates
-        fine_results = []
-        for sim, candidate in top_candidates:
-            cx = candidate.bbox[0] + candidate.bbox[2] / 2
-            cy = candidate.bbox[1] + candidate.bbox[3] / 2
-            fine = self._fine_search(target_image, source_embedding, tag.bbox, (cx, cy))
-            fine_results.extend(fine)
-        
-        # Combine all results
-        all_results.extend(fine_results)
-        
-        # Find best match
-        best_sim, best_candidate = max(all_results, key=lambda x: x[0])
+        # Early exit if we already have a very good match (above threshold + margin)
+        # This avoids expensive fine search when not needed
+        if best_coarse_sim >= self.similarity_threshold + 0.1:
+            best_sim, best_candidate = all_results[0]
+        else:
+            # Do fine search on top 2 candidates (balanced for performance)
+            top_candidates = all_results[:2]
+            
+            # Fine search around top candidates
+            fine_results = []
+            for sim, candidate in top_candidates:
+                cx = candidate.bbox[0] + candidate.bbox[2] / 2
+                cy = candidate.bbox[1] + candidate.bbox[3] / 2
+                fine = self._fine_search(target_image, source_embedding, tag.bbox, (cx, cy))
+                fine_results.extend(fine)
+            
+            # Combine all results
+            all_results.extend(fine_results)
+            
+            # Find best match
+            best_sim, best_candidate = max(all_results, key=lambda x: x[0])
         
         logger.info(
             f"Best match: source={best_candidate.source}, "
@@ -255,15 +326,19 @@ class ProductMatcher:
         source_image: Image.Image,
         tags: list[TagInfo],
         target_image: Image.Image,
-    ) -> list[MatchResult]:
+    ) -> tuple[list[MatchResult], int]:
         """
         Find all tagged products from source image in target image.
+        
+        Returns:
+            Tuple of (results, detections_count)
         """
         # Pre-compute YOLO detections once
         yolo_detections = self.yolo.detect_with_embedding_regions(
             target_image,
             confidence_threshold=self.detection_confidence,
         )
+        detections_count = len(yolo_detections)
         
         results = []
         for tag in tags:
@@ -272,7 +347,7 @@ class ProductMatcher:
             )
             results.append(result)
         
-        return results
+        return results, detections_count
 
     def detect_objects(self, image: Image.Image) -> list[Detection]:
         """Detect all objects in an image using YOLO."""

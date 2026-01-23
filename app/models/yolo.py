@@ -63,6 +63,11 @@ class YOLOModel:
         
         self.model.to(self.device)
         
+        # Store FP16 preference for inference
+        self.use_fp16 = self.device == "cuda"
+        if self.use_fp16:
+            print("YOLO model will use FP16 precision for optimal GPU performance")
+        
     def detect(
         self,
         image: Image.Image,
@@ -80,13 +85,20 @@ class YOLOModel:
         Returns:
             List of Detection objects
         """
-        # Run inference
-        results = self.model(
-            image,
-            conf=confidence_threshold,
-            classes=classes,
-            verbose=False,
-        )
+        # Run inference with GPU optimizations
+        inference_kwargs = {
+            "conf": confidence_threshold,
+            "classes": classes,
+            "verbose": False,
+            "device": self.device,
+            "imgsz": 640,  # Standard size, can be increased for better accuracy if needed
+        }
+        
+        # Enable FP16 for faster inference on modern GPUs
+        if self.use_fp16:
+            inference_kwargs["half"] = True
+        
+        results = self.model(image, **inference_kwargs)
         
         detections = []
         for result in results:

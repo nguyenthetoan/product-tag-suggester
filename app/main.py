@@ -5,6 +5,7 @@ FastAPI service for detecting tagged products across images.
 Uses YOLO for fast candidate detection + CLIP for accurate matching.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from io import BytesIO
 
@@ -93,6 +94,21 @@ class DetectObjectsResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize models on startup."""
+    import torch
+    
+    # Optimize PyTorch for high-performance GPU systems
+    if torch.cuda.is_available():
+        # Enable cuDNN benchmarking for consistent input sizes (faster)
+        torch.backends.cudnn.benchmark = True
+        # Enable cuDNN deterministic mode (optional, can disable for speed)
+        torch.backends.cudnn.deterministic = False
+        # Enable TensorFloat-32 for faster computation on Ampere+ GPUs (RTX 5070 Ti)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print(f"GPU optimizations enabled: CUDA device {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    
+    # Initialize models (this will trigger compilation and optimization)
     get_yolo_model()
     get_embedding_model()
     yield
@@ -160,10 +176,10 @@ async def suggest_tags(request: SuggestTagsRequest):
     - Target image: Another angle of the same kitchen
     - Result: Finds the same kettle and returns its position
     """
-    # Fetch images
-    source_image, target_image = (
-        await fetch_image(request.source_image_url),
-        await fetch_image(request.target_image_url),
+    # Fetch images in parallel
+    source_image, target_image = await asyncio.gather(
+        fetch_image(request.source_image_url),
+        fetch_image(request.target_image_url),
     )
 
     # Convert tags to internal format
@@ -181,11 +197,7 @@ async def suggest_tags(request: SuggestTagsRequest):
         similarity_threshold=request.similarity_threshold,
     )
 
-    results = matcher.find_all_products(source_image, tags, target_image)
-    
-    # Get YOLO detections count for info
-    detections = matcher.detect_objects(target_image)
-    detections_count = len(detections)
+    results, detections_count = matcher.find_all_products(source_image, tags, target_image)
 
     # Convert to response format
     suggestions = []

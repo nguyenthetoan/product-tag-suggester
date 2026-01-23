@@ -1,6 +1,7 @@
 """
 CLIP-based image embedding extractor.
 Uses OpenAI's CLIP model to generate visual embeddings for product matching.
+Optimized for high-performance GPU systems.
 """
 
 import torch
@@ -23,50 +24,80 @@ class EmbeddingModel:
         """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = CLIPModel.from_pretrained(model_name).to(self.device)
-        self.processor = CLIPProcessor.from_pretrained(model_name)
+        # Use fast processor for better performance
+        self.processor = CLIPProcessor.from_pretrained(model_name, use_fast=True)
         self.model.eval()
+        
+        # Enable mixed precision if CUDA is available and supports it
+        self.use_amp = torch.cuda.is_available() and hasattr(torch.cuda, 'amp')
+        
+        # Note: torch.compile can add overhead on first run and may not always be faster
+        # Disabled by default - enable if needed after profiling
+        # if hasattr(torch, 'compile') and self.device == "cuda":
+        #     try:
+        #         self.model = torch.compile(self.model, mode="reduce-overhead")
+        #         print("Model compiled with torch.compile for optimal performance")
+        #     except Exception as e:
+        #         print(f"Could not compile model: {e}")
 
     @torch.no_grad()
-    def get_embedding(self, image: Image.Image) -> torch.Tensor:
+    def get_embedding(self, image: Image.Image, return_cpu: bool = False) -> torch.Tensor:
         """
         Extract embedding vector from an image.
 
         Args:
             image: PIL Image object
+            return_cpu: If True, return CPU tensor. If False, keep on GPU.
 
         Returns:
             Normalized embedding tensor of shape (512,) or (768,) depending on model
         """
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-        embedding = self.model.get_image_features(**inputs)
+        
+        if self.use_amp:
+            with torch.cuda.amp.autocast():
+                embedding = self.model.get_image_features(**inputs)
+        else:
+            embedding = self.model.get_image_features(**inputs)
+        
         # Normalize for cosine similarity
         embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-        return embedding.squeeze(0).cpu()
+        result = embedding.squeeze(0)
+        return result.cpu() if return_cpu else result
 
     @torch.no_grad()
-    def get_embeddings_batch(self, images: list[Image.Image]) -> torch.Tensor:
+    def get_embeddings_batch(self, images: list[Image.Image], return_cpu: bool = False) -> torch.Tensor:
         """
         Extract embeddings from multiple images in a batch (faster than one-by-one).
 
         Args:
             images: List of PIL Image objects
+            return_cpu: If True, return CPU tensor. If False, keep on GPU.
 
         Returns:
             Normalized embedding tensor of shape (N, embed_dim)
         """
         if not images:
-            return torch.tensor([])
+            empty_tensor = torch.tensor([], device=self.device)
+            return empty_tensor.cpu() if return_cpu else empty_tensor
         
         inputs = self.processor(images=images, return_tensors="pt", padding=True).to(self.device)
-        embeddings = self.model.get_image_features(**inputs)
+        
+        if self.use_amp:
+            with torch.cuda.amp.autocast():
+                embeddings = self.model.get_image_features(**inputs)
+        else:
+            embeddings = self.model.get_image_features(**inputs)
+        
         # Normalize for cosine similarity
         embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
-        return embeddings.cpu()
+        return embeddings.cpu() if return_cpu else embeddings
 
     def get_region_embedding(
         self,
         image: Image.Image,
         bbox: tuple[float, float, float, float],
+        return_cpu: bool = False,
     ) -> torch.Tensor:
         """
         Extract embedding from a specific region of an image.
@@ -74,18 +105,20 @@ class EmbeddingModel:
         Args:
             image: PIL Image object
             bbox: Bounding box as (x, y, width, height) in pixels
+            return_cpu: If True, return CPU tensor. If False, keep on GPU.
 
         Returns:
             Normalized embedding tensor
         """
         x, y, w, h = bbox
         cropped = image.crop((x, y, x + w, y + h))
-        return self.get_embedding(cropped)
+        return self.get_embedding(cropped, return_cpu=return_cpu)
 
     def get_region_embeddings_batch(
         self,
         image: Image.Image,
         bboxes: list[tuple[float, float, float, float]],
+        return_cpu: bool = False,
     ) -> torch.Tensor:
         """
         Extract embeddings from multiple regions in a batch.
@@ -93,6 +126,7 @@ class EmbeddingModel:
         Args:
             image: PIL Image object
             bboxes: List of bounding boxes as (x, y, width, height) in pixels
+            return_cpu: If True, return CPU tensor. If False, keep on GPU.
 
         Returns:
             Normalized embedding tensor of shape (N, embed_dim)
@@ -101,7 +135,7 @@ class EmbeddingModel:
         for x, y, w, h in bboxes:
             cropped = image.crop((x, y, x + w, y + h))
             crops.append(cropped)
-        return self.get_embeddings_batch(crops)
+        return self.get_embeddings_batch(crops, return_cpu=return_cpu)
 
 
 @lru_cache(maxsize=1)
