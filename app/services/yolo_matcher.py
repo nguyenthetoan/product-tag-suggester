@@ -125,18 +125,25 @@ class ProductMatcher:
         bboxes = [c.bbox for c in candidates]
         embeddings = self.clip.get_region_embeddings_batch(target_image, bboxes, return_cpu=False)
         
-        # Ensure source_embedding is on same device
+        # Ensure source_embedding is on same device and properly shaped
         if source_embedding.device != embeddings.device:
             source_embedding = source_embedding.to(embeddings.device)
         
-        # Compute similarities on GPU
+        # Ensure source_embedding is 1D for proper matrix multiplication
+        # embeddings: [N, embed_dim], source_embedding: [embed_dim] -> result: [N]
+        if source_embedding.dim() > 1:
+            source_embedding = source_embedding.squeeze()
+        
+        # Compute similarities on GPU (cosine similarity for normalized embeddings)
         similarities = torch.matmul(embeddings, source_embedding)
+        
+        # Ensure similarities is 1D
+        if similarities.dim() > 1:
+            similarities = similarities.squeeze()
         
         # Sort on GPU for better performance, then move top results to CPU
         # Get top-k indices on GPU (faster than sorting all on CPU)
         k = min(50, len(candidates))  # Keep top 50 for further processing
-        if similarities.dim() > 1:
-            similarities = similarities.squeeze(1)
         top_k_values, top_k_indices = torch.topk(similarities, k, dim=0)
         
         # Move only top-k to CPU
@@ -204,14 +211,21 @@ class ProductMatcher:
         bboxes = [c.bbox for c in candidates]
         embeddings = self.clip.get_region_embeddings_batch(target_image, bboxes, return_cpu=False)
         
-        # Ensure source_embedding is on same device
+        # Ensure source_embedding is on same device and properly shaped
         if source_embedding.device != embeddings.device:
             source_embedding = source_embedding.to(embeddings.device)
         
-        # Compute similarities on GPU
+        # Ensure source_embedding is 1D for proper matrix multiplication
+        # embeddings: [N, embed_dim], source_embedding: [embed_dim] -> result: [N]
+        if source_embedding.dim() > 1:
+            source_embedding = source_embedding.squeeze()
+        
+        # Compute similarities on GPU (cosine similarity for normalized embeddings)
         similarities = torch.matmul(embeddings, source_embedding)
+        
+        # Ensure similarities is 1D
         if similarities.dim() > 1:
-            similarities = similarities.squeeze(1)
+            similarities = similarities.squeeze()
         
         # Move to CPU only for final result
         similarities_list = similarities.cpu().tolist()
@@ -219,6 +233,60 @@ class ProductMatcher:
             similarities_list = [similarities_list]
         
         return list(zip(similarities_list, candidates))
+
+    def _validate_match(
+        self,
+        target_image: Image.Image,
+        candidate_bbox: tuple[float, float, float, float],
+        source_bbox: tuple[float, float, float, float],
+        similarity: float,
+        edge_margin: float = 10.0,
+        size_ratio_tolerance: float = 0.5,
+    ) -> bool:
+        """
+        Validate that a candidate match is reasonable.
+        
+        Args:
+            target_image: Target image
+            candidate_bbox: Candidate bounding box (x, y, width, height)
+            source_bbox: Source bounding box (x, y, width, height)
+            similarity: Similarity score
+            edge_margin: Minimum distance from image edges (pixels)
+            size_ratio_tolerance: Maximum allowed size difference ratio
+            
+        Returns:
+            True if match is valid, False otherwise
+        """
+        img_w, img_h = target_image.size
+        x, y, w, h = candidate_bbox
+        src_w, src_h = source_bbox[2], source_bbox[3]
+        
+        # Check if bbox is at image edges (likely false positive)
+        if x < edge_margin or y < edge_margin:
+            return False
+        if x + w > img_w - edge_margin or y + h > img_h - edge_margin:
+            return False
+        
+        # Check if bbox size is reasonable compared to source
+        # Allow some variation but not too much
+        width_ratio = w / src_w if src_w > 0 else 1.0
+        height_ratio = h / src_h if src_h > 0 else 1.0
+        
+        # Size should be within reasonable bounds (0.3x to 3x)
+        if width_ratio < 0.3 or width_ratio > 3.0:
+            return False
+        if height_ratio < 0.3 or height_ratio > 3.0:
+            return False
+        
+        # Check if bbox has reasonable dimensions (not too small)
+        if w < 20 or h < 20:
+            return False
+        
+        # For matches from grid search (not YOLO), require higher confidence
+        # Grid search can find background regions that look similar
+        # We'll check this in the caller by looking at the candidate source
+        
+        return True
 
     def find_product_in_image(
         self,
@@ -247,15 +315,26 @@ class ProductMatcher:
             yolo_bboxes = [det.bbox for det in yolo_detections]
             yolo_embeddings = self.clip.get_region_embeddings_batch(target_image, yolo_bboxes, return_cpu=False)
             
-            # Ensure source_embedding is on same device
+            # Ensure source_embedding is on same device and properly shaped
             if source_embedding.device != yolo_embeddings.device:
                 source_embedding = source_embedding.to(yolo_embeddings.device)
             
-            # Compute similarities on GPU
+            # Ensure source_embedding is 1D for proper matrix multiplication
+            # yolo_embeddings: [N, embed_dim], source_embedding: [embed_dim] -> result: [N]
+            if source_embedding.dim() > 1:
+                source_embedding = source_embedding.squeeze()
+            
+            # Compute similarities on GPU (cosine similarity for normalized embeddings)
             yolo_sims = torch.matmul(yolo_embeddings, source_embedding)
+            
+            # Ensure yolo_sims is 1D
+            if yolo_sims.dim() > 1:
+                yolo_sims = yolo_sims.squeeze()
             
             # Move to CPU only for final result
             yolo_sims_list = yolo_sims.cpu().tolist()
+            if not isinstance(yolo_sims_list, list):
+                yolo_sims_list = [yolo_sims_list]
             
             for det, sim in zip(yolo_detections, yolo_sims_list):
                 all_results.append((sim, Candidate(
@@ -311,7 +390,29 @@ class ProductMatcher:
             f"similarity={best_sim:.3f}, bbox={best_candidate.bbox}"
         )
 
-        found = best_sim >= self.similarity_threshold
+        # Validate the match before accepting it
+        is_valid_match = self._validate_match(
+            target_image, best_candidate.bbox, tag.bbox, best_sim
+        )
+        
+        # For grid search candidates (not YOLO detections), require higher confidence
+        # Grid search can find background regions that look similar but aren't the object
+        if best_candidate.source != "yolo" and best_sim < self.similarity_threshold + 0.15:
+            # Grid search matches need higher confidence to avoid false positives
+            is_valid_match = False
+            logger.info(
+                f"Grid search match requires higher confidence: "
+                f"similarity={best_sim:.3f}, required={self.similarity_threshold + 0.15:.3f}"
+            )
+        
+        found = best_sim >= self.similarity_threshold and is_valid_match
+        
+        if not is_valid_match and best_sim >= self.similarity_threshold:
+            logger.warning(
+                f"Match rejected by validation: similarity={best_sim:.3f}, "
+                f"bbox={best_candidate.bbox}, source_bbox={tag.bbox}, "
+                f"source={best_candidate.source}"
+            )
 
         return MatchResult(
             product_id=tag.product_id,
