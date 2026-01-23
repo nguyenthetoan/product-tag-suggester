@@ -23,6 +23,14 @@ htmlcov/
 # Model cache (optional - you may want to commit these)
 .cache/
 
+# Model files (large, downloaded/generated)
+*.pt
+*.onnx
+*.onnx.data
+models/*.onnx
+models/*.onnx.data
+models/clip_*.onnx
+
 # OS
 .DS_Store
 Thumbs.db

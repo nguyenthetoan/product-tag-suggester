@@ -1,6 +1,6 @@
 # Product Tag Suggester
 
-A microservice for detecting tagged products across images using YOLO + CLIP.
+A microservice for detecting tagged products across images using YOLO + CLIP (with optional ONNX Runtime optimization).
 
 ## Overview
 
@@ -12,6 +12,11 @@ Given an image with tagged products, this service detects if those same products
 3. Returns matches above the similarity threshold with bounding boxes
 
 This approach can match **any product** (kettles, toasters, furniture, etc.) regardless of whether YOLO knows the object class.
+
+**Performance Optimization:**
+- CLIP can be converted to ONNX format for 2-4x faster inference
+- ONNX Runtime with CUDA support provides significant speedup
+- See `scripts/convert_clip_to_onnx.py` for conversion instructions
 
 **Example Use Case:**
 1. User uploads Image 1 (kitchen) and tags a SMEG kettle
@@ -34,7 +39,7 @@ pip install -r requirements.txt
 gunicorn app.main:app -c gunicorn.conf.py
 
 # Or with Uvicorn (development)
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app -b 0.0.0.0:8000
 ```
 
 ### Docker
@@ -118,11 +123,36 @@ GET /health
 | `similarity_threshold` | 0.75 | Minimum CLIP similarity for a match (0-1) |
 | `detection_confidence` | 0.15 | Internal YOLO confidence (lower = more candidates) |
 
+### System Requirements
+
+- **Python**: 3.10-3.13 (for ONNX Runtime support, if using)
+- **CUDA**: 12.x or 13.x (tested with CUDA 13.1)
+- **GPU**: NVIDIA GPU with CUDA support (recommended)
+- **PyTorch**: 2.9.1 with CUDA 13.0 wheels (for RTX 5070 Ti and newer GPUs)
+
 ## Performance
 
-- **Speed:** ~100-200ms per request (YOLO ~50ms + CLIP ~50-150ms)
+- **Speed (PyTorch CLIP):** 3-5 seconds per request (YOLO ~50ms + CLIP ~50-150ms per batch)
+- **Speed (ONNX Runtime):** 0.8-1.5 seconds per request (2-4x faster with ONNX)
 - **GPU:** Automatically uses CUDA if available (~5-10x faster)
 - **Accuracy:** Can match any product, not limited to 80 COCO classes
+
+### ONNX Optimization (Optional)
+
+For faster performance, you can convert CLIP to ONNX format:
+
+```bash
+# Install ONNX dependencies
+pip install onnxruntime-gpu onnxruntime-tools onnx onnxscript
+
+# Convert CLIP to ONNX
+python scripts/convert_clip_to_onnx.py
+
+# The ONNX model will be saved to models/clip_vision.onnx
+# Update app/models/embeddings.py to use ONNXEmbeddingModel
+```
+
+**Note:** ONNX Runtime requires Python 3.10-3.13 (Python 3.14 not yet supported).
 
 ## Integration with communa-web
 
@@ -161,6 +191,14 @@ suggestions
 Models are downloaded on first run (~200MB total). If download fails:
 1. Check internet connection
 2. Pre-download from [Ultralytics releases](https://github.com/ultralytics/assets/releases)
+
+### ONNX Runtime Issues
+
+If using ONNX Runtime:
+- **Python 3.14:** Not supported yet, use Python 3.13 or 3.12
+- **CUDA:** Requires CUDA 12.x or 13.x with compatible drivers
+- **Shape errors:** The ONNX model may need re-exporting with fixed batch sizes
+- See `scripts/convert_clip_to_onnx.py` for conversion options
 
 ## License
 
